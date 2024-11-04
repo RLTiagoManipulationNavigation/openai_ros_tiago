@@ -1,6 +1,7 @@
 import numpy as np
 import rospy
 import time
+import re
 from openai_ros import robot_gazebo_env
 from std_msgs.msg import Float64
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -10,11 +11,16 @@ from sensor_msgs.msg import Image
 from sensor_msgs.msg import Imu
 from sensor_msgs.msg import LaserScan
 from sensor_msgs.msg import PointCloud2
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry , OccupancyGrid
 from nav_msgs.msg import Path
-from geometry_msgs.msg import Twist , PoseStamped, Point, Quaternion
+from geometry_msgs.msg import Twist , PoseStamped, Point, Quaternion , PoseWithCovarianceStamped , Pose
+from std_srvs.srv import Empty
 import actionlib
 from move_base_msgs.msg import MoveBaseActionGoal
+from nav_msgs.srv import GetPlan , GetMap
+from geometry_msgs.msg import PoseArray , PoseStamped
+import tf2_ros
+
 
 #roslaunch tiago_2dnav_gazebo tiago_navigation.launch public_sim:=true
 
@@ -60,6 +66,11 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         self.hand_joints = ['gripper_left_finger_joint' , 'gripper_right_finger_joint']
         # Doesnt have any accesibles
         self.controllers_list = []
+        #self.controllers_list = [
+        #    "arm_controller",
+        #    "mobile_base_controller",
+        #    "joint_state_controller"
+        #]
 
         # It doesnt use namespace
         self.robot_name_space = ""
@@ -67,7 +78,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         # We launch the init function of the Parent Class robot_gazebo_env.RobotGazeboEnv
         super(TiagoEnv, self).__init__(controllers_list=self.controllers_list,
                                             robot_name_space=self.robot_name_space,
-                                            reset_controls=False,
+                                            reset_controls=True,
                                             #start_init_physics_parameters=False,
                                             reset_world_or_sim="WORLD")
 
@@ -104,6 +115,27 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         #self._torso_pub = rospy.Publisher('/torso_controller/command', JointTrajectory, queue_size=1)
         #self._head_pub = rospy.Publisher('/head_controller/command', JointTrajectory, queue_size=1)
         #self._hand_pub = rospy.Publisher('/hand_controller/command', JointTrajectory, queue_size=1)
+        
+        # Create publisher for /initialpose topic
+        self.init_pose_pub = rospy.Publisher('/initialpose', PoseWithCovarianceStamped, queue_size=1)
+
+        self.make_plan = rospy.ServiceProxy("/move_base/make_plan", GetPlan)
+
+        #reset simulation 
+        rospy.wait_for_service('/move_base/clear_costmaps')
+        rospy.wait_for_service('/static_map')
+        self.target_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=1)
+        self.clear_costmaps = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
+        self.get_map = rospy.ServiceProxy('/static_map', GetMap)
+
+        #save initial map
+        self.initial_map = self.get_map().map
+
+        self.map_pub = rospy.Publisher('/map', OccupancyGrid, queue_size=1)
+        
+        # Initialize TF listener
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         self._check_all_systems_ready()
         self._check_publishers_connection()
@@ -287,6 +319,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
 
     def _arm_state_callback(self , data):
         self.arm_state = data
+
     """
     def _head_feedback_callback(self , data):
         self.head = data 
@@ -384,6 +417,65 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         
     # Methods that the TrainingEnvironment will need.
     # ----------------------------
+    
+    def reset_position(self):
+        self.gazebo.unpauseSim()
+
+        # Create the initial pose message
+        init_pose_msg = PoseWithCovarianceStamped()
+    
+        # Set the header
+        init_pose_msg.header.frame_id = "map"
+        init_pose_msg.header.stamp = rospy.Time.now()
+    
+        # Set the position
+        init_pose_msg.pose.pose = Pose(
+            Point(0.0, 0.0, 0.0),  # x, y, z position
+            Quaternion(0.0, 0.0, 0.0, 1.0)  # x, y, z, w orientation
+        )
+            
+        self.init_pose_pub.publish(init_pose_msg)
+        rospy.logwarn("Set the robot's iniital pose")
+        #reset global and local costmap
+        self.clear_costmaps()    
+        rospy.logwarn("Reset obstacles complete !")
+  
+        # Make sure the publisher has time to connect
+        rospy.sleep(5.0)
+        self.map_pub.publish(self.initial_map)    
+        rospy.logwarn("Reset map complete!")
+        rospy.sleep(2.0)
+
+        # Get transform from map to base_footprint
+        transform = self.tf_buffer.lookup_transform(
+                'map',
+                'base_footprint',
+                rospy.Time(0),
+                rospy.Duration(1.0)
+        )
+            
+        # Print current position
+        rospy.loginfo(f"Current position: x={transform.transform.translation.x}, "
+                         f"y={transform.transform.translation.y}, "
+                         f"z={transform.transform.translation.z}")
+        
+    
+        # Publish the message
+        #self.init_pose_pub.publish(init_pose_msg)
+        #rospy.loginfo("Published reset position to /initialpose")
+    
+        # Give time for the message to be processed
+        #rospy.sleep(0.5)
+
+        self.gazebo.pauseSim()
+
+    def reset_costmap(self):   
+        self.gazebo.unpauseSim()
+        self.clear_costmaps()  
+        self.gazebo.pauseSim() 
+    
+
+
 
     def move_arm(self, target_positions, duration=5.0):
         """
@@ -577,9 +669,10 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
                         break
         return robot_has_crashed
     
-    def goal_setting(self , x , y , z , yaw):
-        #self.gazebo.unpauseSim()
-
+    def goal_setting(self , x , y , z , yaw , curr_x_pos , curr_y_pos):
+        self.gazebo.unpauseSim()
+    
+        """
         # Create the goal message
         goal_msg = MoveBaseActionGoal()
     
@@ -602,7 +695,76 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         self._goal_pub.publish(goal_msg)
 
         #self.gazebo.pauseSim()
+        """
+    
+        # Define start_pose
+        start_pose = PoseStamped()
+        start_pose.header.frame_id = "map"  # Use "map" or "odom" as the frame of reference
+        start_pose.header.stamp = rospy.Time.now()  # Set the current time
 
+        # Set position for start_pose
+        start_pose.pose.position.x = curr_x_pos  # Starting x-coordinate
+        start_pose.pose.position.y = curr_y_pos  # Starting y-coordinate
+        start_pose.pose.position.z = 0.0  # Often 0 for a 2D navigation
+
+        # Set orientation for start_pose (quaternion values for no rotation)
+        start_pose.pose.orientation.x = 0.0
+        start_pose.pose.orientation.y = 0.0
+        start_pose.pose.orientation.z = 0.0
+        start_pose.pose.orientation.w = 1.0  # w = 1 means no rotation
+
+        # Define goal_pose
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = "map"
+        goal_pose.header.stamp = rospy.Time.now()
+
+        # Set position for goal_pose
+        goal_pose.pose.position.x = x  # Goal x-coordinate
+        goal_pose.pose.position.y = y  # Goal y-coordinate
+        goal_pose.pose.position.z = z
+
+        # Set orientation for goal_pose (optional; here, same as start)
+        goal_pose.pose.orientation.x = 0.0
+        goal_pose.pose.orientation.y = 0.0
+        goal_pose.pose.orientation.z = 0.0
+        goal_pose.pose.orientation.w = 1.0
+
+        try:
+            response = self.make_plan(start_pose, goal_pose, 0.5)
+            #rospy.loginfo(str(response))
+        except rospy.ServiceException as e:
+            rospy.logerr("Failed to make plan: %s" % e)
+        self.gazebo.pauseSim()
+        # Find all position blocks in the message
+        position_blocks = re.findall(r'position:\s*x:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*y:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', str(response))
+        
+        # Convert to numpy array
+        if position_blocks:
+            positions = np.array(position_blocks, dtype=float)
+            return positions
+        return np.array([])
+    
+    def tf_position(self):
+        # Get transform from map to base_footprint
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                    'map',
+                    'base_footprint',
+                    rospy.Time(0),
+                    rospy.Duration(1.0)
+            )
+            base_coord = [transform.transform.translation.x
+                      , transform.transform.translation.y 
+                      , transform.transform.translation.z]
+            # Print current position
+            #rospy.loginfo(f"Current position: x={transform.transform.translation.x}, "
+            #             f"y={transform.transform.translation.y}, "
+            #             f"z={transform.transform.translation.z}")
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            rospy.logerr(f"TF lookup failed: {e}")
+            base_coord = []
+        return base_coord
         
 
     def get_odom(self):
@@ -622,6 +784,9 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         
     def get_laser_scan(self):
         return self.laser_scan
+    
+    def get_plan(self):
+        return self.plan
         
     def reinit_sensors(self):
         """

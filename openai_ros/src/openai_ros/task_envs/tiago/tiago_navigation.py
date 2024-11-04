@@ -7,6 +7,9 @@ from geometry_msgs.msg import Vector3
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 import math
+from tf.transformations import quaternion_from_euler
+
+
 
 max_episode_steps = 1000000 # Can be any Value
 
@@ -23,7 +26,6 @@ class TiagoNav(tiago_env.TiagoEnv):
         closed room with columns.
         It will learn how to move around without crashing.
         """
-
         # Only variable needed to be set here
         #self.action_space = spaces.Discrete(number_actions)
         
@@ -97,6 +99,18 @@ class TiagoNav(tiago_env.TiagoEnv):
     
         self.cumulated_steps = 0.0
 
+        #odom_init = self.get_odom()
+        self.set_initial_odom_x = 0.0
+        self.set_initial_odom_y = 0.0
+        self.set_initial_odom_z = 0.0
+
+        self.min_pos_x = 10000000
+        self.min_pos_y = 10000000
+
+        self.prev_distance = math.sqrt((self.x)**2 + (self.y)**2 + (self.z)**2)
+
+        self.path = np.array([])
+
         # Here we will add any init functions prior to starting the MyRobotEnv
         super(TiagoNav, self).__init__()
         
@@ -110,6 +124,18 @@ class TiagoNav(tiago_env.TiagoEnv):
                         self.init_linear_turn_speed,
                         epsilon=0.05,
                         update_rate=10)
+        self.reset_position()
+        self.path = self.goal_setting(self.x ,self.y , self.z , 0.0 , 0.0 , 0.0)
+
+        #odom_init = self.get_odom()
+        #self.set_initial_odom_x = odom_init.pose.pose.position.x
+        #self.set_initial_odom_y = odom_init.pose.pose.position.y
+        #self.set_initial_odom_z = odom_init.pose.pose.position.z
+        
+
+
+        
+        #rospy.loginfo(" postion : " + str(odom_init.pose.pose.position.x))
         #self.goal_setting(self.x , self.y , self.z , self.yaw)
         #rospy.logdebug("path :"+str(self._check_plan_ready()))
         
@@ -126,6 +152,7 @@ class TiagoNav(tiago_env.TiagoEnv):
         self.cumulated_reward = 0.0
         # Set to false Done, because its calculated asyncronously
         self._episode_done = False
+        self.truncated = False
 
 
     def _set_action(self, action):
@@ -213,17 +240,28 @@ class TiagoNav(tiago_env.TiagoEnv):
     '''
     def _compute_reward(self, observations, done):
 
-        odom_data = self.get_odom()
+        #odom_data = self.get_odom()
+        base_coord = self.tf_position()
+        #pose_data = self.get_pose()
         laser_msg = self.get_laser_scan()
         collision_distance = min(laser_msg.ranges)
 
         reward = 0
 
+        self.reset_costmap()
+
+        #generate a new plan froom current position
+        #self.path = self.goal_setting(self.x ,self.y , self.z , 0.0  
+        #                              , base_coord[0] 
+        #                              , base_coord[1])
+
         #RMSE for calclate distance between current and goal position
-        distance_error = math.sqrt((self.x - odom_data.pose.pose.position.x)**2 
-                                   + (self.y - odom_data.pose.pose.position.y)**2 
-                                   + (self.z - odom_data.pose.pose.position.z)**2)
-        reward += -self.distance_weight * distance_error
+        distance_error = math.sqrt((self.x - base_coord[0])**2 
+                                   + (self.y - base_coord[1])**2 
+                                   + (self.z - base_coord[2])**2)
+        
+        
+        #reward += -self.distance_weight * distance_error
         #collision reward
         if collision_distance < 0.07 :
             reward += self.collision_weight * self.collision_reward
@@ -232,15 +270,15 @@ class TiagoNav(tiago_env.TiagoEnv):
             reward += -self.proximity_weight*abs( self.obstacle_proximity - min(self.obstacle_proximity , collision_distance))
         #guide reward
         
-        '''
-        if not done:
-            if self.last_action == "FORWARDS":
-                reward = self.forwards_reward
-            else:
-                reward = self.turn_reward
-        else:
-            reward = -1*self.end_episode_points
-        '''
+        #if abs(self.x - (odom_data.pose.pose.position.x - self.set_initial_odom_x)) < 0.6 and abs(self.y - (odom_data.pose.pose.position.y - self.set_initial_odom_y)) < 0.6 :
+        #    self.truncated = True
+        #    reward += 100
+   
+        #define a numpy aray for simplify the definition of the guidance reward
+        #rob_pos = np.array([(odom_data.pose.pose.position.x - self.set_initial_odom_x) , (odom_data.pose.pose.position.y - self.set_initial_odom_y) ])
+        if len(self.path) != 0 :
+            reward += self.guide_weight*self.guide_reward(self.path , base_coord[:2])
+
 
         rospy.logdebug("reward=" + str(reward))
         self.cumulated_reward += reward
@@ -249,6 +287,77 @@ class TiagoNav(tiago_env.TiagoEnv):
         rospy.logdebug("Cumulated_steps=" + str(self.cumulated_steps))
         
         return reward
+    
+    def guide_reward(self , path_coords, robot_pos):
+        """
+        Calculate the natural guidance reward.
+        
+        Args:
+            path_coords (np.ndarray): Array of shape (n, 2) containing path x,y coordinates
+            robot_pos (np.ndarray): Robot's current position [x, y]
+            
+        Returns:
+            float: Reward value
+        """
+        if len(path_coords) == 0:
+            #rospy.logerr("Empty path!")
+            return 0.0
+        # Find closest waypoint
+        closest_idx, min_distance = self.find_closest_waypoint(path_coords, robot_pos)
+        
+        # Calculate the goal position to reach 0.6m ahead
+        ahead_dist = 0.6
+        goal_postion = self.calculate_goal_position(path_coords , closest_idx , ahead_dist)
+        
+        # Calculate reward (negative distance to guidance point)
+        distance_to_guidance = -np.linalg.norm(goal_postion - robot_pos)
+        
+        
+        return distance_to_guidance
+
+    def find_closest_waypoint(self , path_coords, robot_pos):
+        """
+        Find the closest waypoint on the path to the robot's position.
+        
+        Args:
+            path_coords (np.ndarray): Array of shape (n, 2) containing path x,y coordinates
+            robot_pos (np.ndarray): Robot's current position [x, y]
+            
+        Returns:
+            tuple: (closest point index, distance to closest point)
+        """
+        distances = np.linalg.norm(path_coords - robot_pos, axis=1)
+        closest_idx = np.argmin(distances)
+        return closest_idx, distances[closest_idx]
+    
+    def calculate_goal_position(self , path_coords , closest_idx , cum_distance):
+        """
+        Calculate cumulative distances along the path.
+        
+            
+        Returns:
+            np.ndarray: Array with the goal position to reach 
+        """
+        ahead_dist = 0.0
+        curr_index = closest_idx
+        curr_pos = path_coords[closest_idx]
+
+        #control if there is only the final goal position of global path
+        if curr_index == path_coords.shape[0] - 1 :
+              return curr_pos
+
+        goal_coord = curr_pos
+
+        while ahead_dist < cum_distance :
+            curr_index += 1
+            goal_coord = path_coords[curr_index]    
+            ahead_dist += np.linalg.norm(goal_coord - curr_pos)
+            curr_pos = goal_coord
+            #control if reach the final position of global path 
+            if curr_index == path_coords.shape[0] - 1 :
+                break
+        return goal_coord
+
     
     def step(self , action):
          # Execute the action
