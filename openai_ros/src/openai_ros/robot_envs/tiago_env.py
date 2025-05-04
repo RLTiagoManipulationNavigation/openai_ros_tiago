@@ -965,4 +965,3 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         #rospy.sleep(0.2)
         self.map_pub.publish(self.initial_map)    
         rospy.logdebug("Reset map complete!")
-

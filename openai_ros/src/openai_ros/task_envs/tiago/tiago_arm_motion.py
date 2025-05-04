@@ -8,7 +8,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 import math
 
-max_episode_steps = 1000000 # Can be any Value
+max_episode_steps = 100 # Can be any Value
 
 register(
         id='TiagoArmMotion-v0',

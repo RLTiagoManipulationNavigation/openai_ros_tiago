@@ -53,6 +53,7 @@ class TiagoNav(tiago_env.TiagoEnv):
         self.collision_reward = rospy.get_param("/Reward_param/collision_reward")
 
         self.cumulated_steps = 0.0
+        
 
         # Here we will add any init functions prior to starting the MyRobotEnv
         super(TiagoNav, self).__init__()

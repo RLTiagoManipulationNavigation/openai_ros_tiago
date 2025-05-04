@@ -29,6 +29,23 @@ class RobotGazeboEnv(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
+    """ Old piece of code    
+    def step(self, action):
+        rospy.logdebug("START STEP OpenAIROS")
+
+        self.gazebo.unpauseSim()
+        self._set_action(action)
+        self.gazebo.pauseSim()
+        obs = self._get_obs()
+        done = self._is_done(obs)
+        info = {}
+        reward = self._compute_reward(obs, done)
+        self.cumulated_episode_reward += reward
+
+        rospy.logdebug("END STEP OpenAIROS")
+
+        return obs, reward, done, info"""
+    # piece of code to connect openai_ros with gymnasium
     def step(self, action):
         """
         Function executed each time step.
@@ -47,24 +64,25 @@ class RobotGazeboEnv(gym.Env):
         self.gazebo.unpauseSim()
         self._set_action(action)
         self.gazebo.pauseSim()
-        obs = self._get_obs()
+        obs , info = self._get_obs()
         done = self._is_done(obs)
-        info = {}
+        #info = {}
         reward = self._compute_reward(obs, done)
         self.cumulated_episode_reward += reward
 
         rospy.logdebug("END STEP OpenAIROS")
 
-        return obs, reward, done, info
+        return obs, reward, done, None, info
 
+    #modify for gymnasium
     def reset(self):
         rospy.logdebug("Reseting RobotGazeboEnvironment")
         self._reset_sim()
         self._init_env_variables()
         self._update_episode()
-        obs = self._get_obs()
+        obs , info = self._get_obs()
         rospy.logdebug("END Reseting RobotGazeboEnvironment")
-        return obs
+        return obs , info
 
     def close(self):
         """
