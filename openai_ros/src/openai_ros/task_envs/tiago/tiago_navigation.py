@@ -7,54 +7,60 @@ from geometry_msgs.msg import Vector3
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 import math
+import time
 from tf.transformations import quaternion_from_euler
+import os
+import rospkg
+import random
+import matplotlib.pyplot as plt
+
+from std_srvs.srv import Empty
 
 
 
-max_episode_steps = 1000000 # Can be any Value
+max_episode_steps = 150 # Can be any Value
 
 register(
         id='TiagoNavigation-v0',
         entry_point='openai_ros.task_envs.tiago.tiago_navigation:TiagoNav',
-        max_episode_steps=max_episode_steps,
+        max_episode_steps=100,
     )
+class RewardNormalizer:
+    def __init__(self):
+        self.mean = 0
+        self.var = 1
+        self.count = 1e-4  # To avoid division by zero
 
+    def normalize(self, reward):
+        self.count += 1
+        delta = reward - self.mean
+        self.mean += delta / self.count
+        delta2 = reward - self.mean
+        self.var = (self.var * (self.count - 1) + delta * delta2) / self.count
+        std = np.sqrt(self.var) + 1e-8
+        return reward / std
+    
 class TiagoNav(tiago_env.TiagoEnv):
     def __init__(self):
-        """
-        This Task Env is designed for having the TurtleBot3 in the turtlebot3 world
-        closed room with columns.
-        It will learn how to move around without crashing.
-        """
-        # Only variable needed to be set here
-        #self.action_space = spaces.Discrete(number_actions)
-        
-        
+        self.reward_normalizer = RewardNormalizer()
         # We set the reward range, which is not compulsory but here we do it.
         self.reward_range = (-np.inf, np.inf)
-        
-        self.truncated = False
-        #number_observations = rospy.get_param('/turtlebot3/n_observations')
-        '''
-        We set the Observation space for the 6 observations
-        cube_observations = [
-            round(current_disk_roll_vel, 0),
-            round(y_distance, 1),
-            round(roll, 1),
-            round(pitch, 1),
-            round(y_linear_speed,1),
-            round(yaw, 1),
-        ]
-        '''
+
         # Goal position
-        self.x = rospy.get_param('/Test_Goal/x')
-        self.y = rospy.get_param('/Test_Goal/y')
-        self.z = rospy.get_param('/Test_Goal/z')
-        self.yaw = 0
+        self.goal_pos = np.array([
+                                rospy.get_param('/Test_Goal/x'),
+                                rospy.get_param('/Test_Goal/y'),
+                                rospy.get_param('/Test_Goal/z')
+                                ])
+        
+        # Goal position  epsilon , maximum error for goal position 
+        self.goal_eps = np.array([
+                                    rospy.get_param('/Test_Goal/eps_x'),
+                                    rospy.get_param('/Test_Goal/eps_y'),
+                                    rospy.get_param('/Test_Goal/eps_z')
+                                ])
         
         # Actions and Observations
-        self.init_linear_forward_speed = rospy.get_param('/Tiago/init_linear_forward_speed')
-        self.init_linear_turn_speed = rospy.get_param('/Tiago/init_linear_turn_speed')
         
         self.new_ranges = rospy.get_param('/Tiago/new_ranges')
         self.max_laser_value = rospy.get_param('/Tiago/max_laser_value')
@@ -63,7 +69,9 @@ class TiagoNav(tiago_env.TiagoEnv):
         self.min_linear_velocity = rospy.get_param('/Tiago/min_linear_velocity')
         self.max_angular_velocity = rospy.get_param('/Tiago/max_angular_velocity')
         self.min_angular_velocity = rospy.get_param('/Tiago/min_angular_velocity')
-        self.min_range = rospy.get_param('/Tiago/min_range')
+        self.min_range = rospy.get_param('/Tiago/min_range') # Minimum meters below wich we consider we have crashed
+
+        self.n_discard_scan = rospy.get_param("/Tiago/remove_scan")
 
 
         #reward weights
@@ -72,75 +80,101 @@ class TiagoNav(tiago_env.TiagoEnv):
         self.proximity_weight = rospy.get_param("/Reward_param/proximity_weight")
         self.collision_reward = rospy.get_param("/Reward_param/collision_reward")
         self.obstacle_proximity = rospy.get_param("/Reward_param/obstacle_proximity")
-
         self.distance_weight = rospy.get_param("/Reward_param/distance_weight")
-        
-        
+
+        #training parameter 
+        self.single_goal = rospy.get_param("/Training/single_goal")
+        self.dyn_path = rospy.get_param("/Training/dyn_path")
+        self.waypoint_dist = rospy.get_param("/Training/dist_waypoint")
+        self.n_waypoint = rospy.get_param('/Training/n_waypoint')
+        self.ahead_dist = rospy.get_param("/Training/ahead_dist")
+
+
         # We create two arrays based on the binary values that will be assigned
         # In the discretization method.
+        
         laser_scan = self._check_laser_scan_ready()
 
-        num_laser_readings = int(len(laser_scan.ranges)/self.new_ranges)
+        num_laser_readings = int(len(laser_scan.ranges))
         rospy.logdebug("num_laser_readings : " + str(num_laser_readings))
         high = np.full((num_laser_readings), laser_scan.range_max)
         low = np.full((num_laser_readings), laser_scan.range_min)
         
-        # We only use two integers
+        # Generate observation space
         self.observation_space = spaces.Box(low, high)
-
+    
         # Set possible value of linear velocity and angular velocity 
         min_velocity = [self.min_linear_velocity , self.min_angular_velocity]
         max_velocity = [self.max_linear_velocity , self.max_angular_velocity]
+
+        #Generate action space
         self.action_space = spaces.Box(np.array(min_velocity), np.array(max_velocity))
         
         rospy.logdebug("ACTION SPACES TYPE===>"+str(self.action_space))
         rospy.logdebug("OBSERVATION SPACES TYPE===>"+str(self.observation_space))
+
+        self.curr_robot_pos = np.array([0,0,0])
+        #used for control if the robot are block 
+        self.max_stationary_step = 0
+
         
-    
-        self.cumulated_steps = 0.0
-
-        #odom_init = self.get_odom()
-        self.set_initial_odom_x = 0.0
-        self.set_initial_odom_y = 0.0
-        self.set_initial_odom_z = 0.0
-
-        self.min_pos_x = 10000000
-        self.min_pos_y = 10000000
-
-        self.prev_distance = math.sqrt((self.x)**2 + (self.y)**2 + (self.z)**2)
-
-        self.path = np.array([])
-
         # Here we will add any init functions prior to starting the MyRobotEnv
         super(TiagoNav, self).__init__()
-        
+        self.rospack = rospkg.RosPack()
+        self.path = self.goal_setting( self.goal_pos[0] , self.goal_pos[1] , 0.0 , 0.0 , 0.0 , 0.0)
+
+        """with open(self.rospack.get_path('tiago_navigation') + "/data/global_path.txt", 'a') as file:
+            # Append the new data to the end of the file
+            file.write(str(self.path))"""  
+
+        self.initial_position = self.gazebo_robot_state()
+        self.initx = self.initial_position[0]
+        self.inity = self.initial_position[1]
+        self.initw = self.initial_position[3]
         
 
     def _set_init_pose(self):
-        """Sets the Robot in its init pose
         """
-        
-        self.move_base( self.init_linear_forward_speed,
-                        self.init_linear_turn_speed,
-                        epsilon=0.05,
-                        update_rate=10)
-        self.reset_position()
-        self.path = self.goal_setting(self.x ,self.y , self.z , 0.0 , 0.0 , 0.0)
+            Sets the Robot in its init pose and reset simulation environment
+        """
+        #reset simulation
+        self.gazebo_reset(self.initx , self.inity , self.initw)
+        # Short delay for stability
+        rospy.sleep(0.5)
+        #random_index = random.randint(0, (len(self.paths) - 1))
+        #self.path = self.paths[random_index]
+        rospy.loginfo(" Initial position : " + str(self.gazebo_robot_state()))
 
-        #odom_init = self.get_odom()
-        #self.set_initial_odom_x = odom_init.pose.pose.position.x
-        #self.set_initial_odom_y = odom_init.pose.pose.position.y
-        #self.set_initial_odom_z = odom_init.pose.pose.position.z
+        rospy.loginfo(str(self.amcl_position()))
+        # self.reset_position()
+        self.move_base( 0.0,
+                        0.0)
         
-
-
         
-        #rospy.loginfo(" postion : " + str(odom_init.pose.pose.position.x))
-        #self.goal_setting(self.x , self.y , self.z , self.yaw)
-        #rospy.logdebug("path :"+str(self._check_plan_ready()))
+        #self.path = self.goal_setting( self.goal_pos[0] , self.goal_pos[1] , 0.0 , 0.0 , 0.0 , 0.0)
+        #goal = self._initialize_goal_position()
+        #self.path = self.goal_setting( goal[0] , goal[1] , 0.0 , 0.0 , 0.0 , 0.0)
+        #self.goal_pos = np.array([goal[0] , goal[1] , 0])
+        #self.get_laser_scan()
         
         return True
 
+    def _initialize_goal_position(self):
+        distance = np.random.uniform(0.1, 1.5)
+        prob = np.random.rand()
+        if prob <= 0.2:
+            # Straight-line movement
+            goal_pos = [distance , 0.0]
+            #action = np.array([np.cos(direction), np.sin(direction)])
+        elif prob <= 0.5 and prob > 0.2:
+            # Curvy movement
+            direction = np.random.uniform( -np.pi/2, np.pi/2)
+            goal_pos = [distance*np.cos(direction) , distance*np.sin(direction)]
+        else:
+            # Fully random movement
+            direction = np.random.uniform(-np.pi, np.pi)
+            goal_pos = [distance*np.cos(direction) , distance*np.sin(direction)]
+        return goal_pos
 
     def _init_env_variables(self):
         """
@@ -148,11 +182,10 @@ class TiagoNav(tiago_env.TiagoEnv):
         of an episode.
         :return:
         """
-        # For Info Purposes
         self.cumulated_reward = 0.0
-        # Set to false Done, because its calculated asyncronously
         self._episode_done = False
         self.truncated = False
+        self.cumulated_steps = 0
 
 
     def _set_action(self, action):
@@ -161,26 +194,11 @@ class TiagoNav(tiago_env.TiagoEnv):
         based on the action number given.
         :param action: The action integer that set s what movement to do next.
         """
-
-        rospy.logdebug("Start Set Action ==>"+str(action))
-        if action[0] >= self.min_linear_velocity and action[0] <= self.max_linear_velocity :
-            curr_linear_vel = action[0]
-        else :
-            if action[0] < self.min_linear_velocity :
-                curr_linear_vel = self.min_linear_velocity
-            else : 
-                curr_linear_vel = self.max_linear_velocity 
-
-        if action[1] >= self.min_angular_velocity and action[1] <= self.max_angular_velocity :
-            curr_angular_vel = action[1]
-        else :
-            if action[1] < self.min_angular_velocity :
-                curr_angular_vel = self.min_angular_velocity
-            else : 
-                curr_angular_vel = self.max_angular_velocity               
+        linear = ((action[0] + 1) * (self.max_linear_velocity - self.min_linear_velocity) / 2 + self.min_linear_velocity)
+        angular = ((action[1] + 1) * (self.max_angular_velocity - self.min_angular_velocity) / 2 + self.min_angular_velocity)
 
         # We tell Tiago the linear and angular speed to set to execute
-        self.move_base(curr_linear_vel, curr_angular_vel, epsilon=0.05, update_rate=10)
+        self.move_base(linear , angular)
         
         rospy.logdebug("END Set Action ==>"+str(action))
 
@@ -192,140 +210,233 @@ class TiagoNav(tiago_env.TiagoEnv):
         :return:
         """
         rospy.logdebug("Start Get Observation ==>")
-        # We get the laser scan data
+        # We get the laser scan data and position of robot
         laser_scan = self.get_laser_scan()
-        #necessary in gymnasium reset()
+        base_coord = self.amcl_position()
+        #local_costmap = self.gen_local_costamp()
         info = {}
+
+        """if self.dyn_path:
+            new_path = self.goal_setting( self.goal_pos[0] , self.goal_pos[1] , 0.0 , 0.0 , base_coord[0] , base_coord[1])
+            if new_path is not None:
+                self.path = new_path"""
         
         discretized_observations = self.discretize_scan_observation(    laser_scan,
                                                                         self.new_ranges
-                                                                        )
+                                                                    ) 
+        waypoints , final_pos = self.find_upcoming_waypoint(self.path , base_coord[:2] , self.n_waypoint , base_coord[3])
 
-        #rospy.logdebug("Observations==>"+str(discretized_observations))
-        rospy.logdebug("END Get Observation ==>")
-    
-        return discretized_observations , info
+        if abs(self.goal_pos[0] - base_coord[0]) < self.goal_eps[0] and abs(self.goal_pos[1] - base_coord[1]) < self.goal_eps[1] :
+            self.truncated = True
+            rospy.loginfo("Goal reach at position : " + str(base_coord))
+            info["goal_reach"] = True  
+        #rospy.loginfo(str(final_pos))
+        # Insert the waypoints into the dictionary
+        info['waypoints'] = waypoints
+        info['final_pos'] = []
+        info['final_pos'].append(self.convert_global_to_robot_coord( float(rospy.get_param('/Test_Goal/x')) , float(rospy.get_param('/Test_Goal/y')) , base_coord[:2] , base_coord[3]))
+        info['curr_pos'] = []
+        info['curr_pos'].append(base_coord[:2])
+        info['truncated'] = self.truncated
         
+        rospy.logdebug("END Get Observation ==>")
+        #control of stationary of robot
+        
+        if np.linalg.norm(self.curr_robot_pos - base_coord[:3]) < 0.001:
+            self.max_stationary_step += 1
+        else:
+            self.curr_robot_pos = base_coord[:3]
+            self.max_stationary_step = 0   
+
+        return discretized_observations , info
     
+    def find_upcoming_waypoint(self , path_coords , robot_pos , n_waypoint , yaw):
+        waypoints = []
+
+        count_waypoint = 1
+        
+        closest_idx, _ = self.find_closest_waypoint(path_coords, robot_pos)
+
+        if closest_idx != path_coords.shape[0] - 1 :
+            curr_waypoint_x , curr_waypoint_y = path_coords[closest_idx+1] 
+            # Store result
+            waypoints.append(self.convert_global_to_robot_coord(curr_waypoint_x.copy() , curr_waypoint_y.copy() , robot_pos , yaw))
+
+            for x_i, y_i in [tuple(coord) for coord in path_coords[closest_idx+1:]]: 
+                
+                if math.sqrt((x_i - curr_waypoint_x)**2 + (y_i - curr_waypoint_y)**2) >= self.waypoint_dist:
+                    #update waypoint
+                    curr_waypoint_x = x_i
+                    curr_waypoint_y = y_i
+                    # Store result
+                    waypoints.append(self.convert_global_to_robot_coord(x_i , y_i , robot_pos , yaw))
+
+                    count_waypoint += 1
+
+                    if count_waypoint == self.n_waypoint :
+                        break 
+
+        
+        # If not enough waypoints were added, fill with the last element of path_coords
+        if len(waypoints) < n_waypoint:
+            curr_waypoint_x , curr_waypoint_y = path_coords[-1] 
+        
+            waypoints.extend([self.convert_global_to_robot_coord(curr_waypoint_x.copy() , curr_waypoint_y.copy() , robot_pos , yaw)] * (n_waypoint - len(waypoints)))
+        #generate coord of terminal position 
+        final_pos = []
+
+        curr_waypoint_x , curr_waypoint_y = path_coords[-1] 
+        
+        final_pos.append(self.convert_global_to_robot_coord(curr_waypoint_x.copy() , curr_waypoint_y.copy() , robot_pos , yaw))
+
+        return waypoints , final_pos
+    
+    def convert_global_to_robot_coord(self , x_i , y_i , robot_pos , yaw):
+
+        # Translate
+        x_prime = x_i - robot_pos[0]
+        y_prime = y_i - robot_pos[1]
+            
+        # Rotate
+        x_double_prime = x_prime * math.cos(yaw) + y_prime * math.sin(yaw)
+        y_double_prime = -x_prime * math.sin(yaw) + y_prime * math.cos(yaw)
+
+        #if self.norm_input:
+            # Convert to simple float values
+        x_double_prime = float(x_double_prime)/3.5
+        y_double_prime = float(y_double_prime)/3.5
+
+        """if x_double_prime > 1.0:
+            x_double_prime = 1.0
+        elif x_double_prime < -1.0:
+            x_double_prime = -1.0       
+        if y_double_prime > 1.0:    
+            y_double_prime = 1.0
+        elif y_double_prime < -1.0:
+            y_double_prime = -1.0"""
+
+        return x_double_prime , y_double_prime
+
+
     def _is_done(self, observations):
         
-        """
-        if self._episode_done:
-            rospy.logerr("Tiago is Too Close to wall==>")
-        else:
-            rospy.logwarn("Tiago is NOT close to a wall ==>")
-        """
         if min(observations) <= self.min_range :
             rospy.logerr("Tiago is Too Close to wall==>")
             self._episode_done = True    
-            
-        # Now we check if it has crashed based on the imu
-        """
-        imu_data = self.get_imu()
-        linear_acceleration_magnitude = self.get_vector_magnitude(imu_data.linear_acceleration)
-        if linear_acceleration_magnitude > self.max_linear_aceleration:
-            rospy.logerr("Tiago Crashed==>"+str(linear_acceleration_magnitude)+">"+str(self.max_linear_aceleration))
+        
+        #control if robot are block
+        if self.max_stationary_step == 30:
+            self.max_stationary_step = 0
             self._episode_done = True
-        else:
-            rospy.logerr("DIDNT crash Tiago ==>"+str(linear_acceleration_magnitude)+">"+str(self.max_linear_aceleration))
-        """
+            rospy.loginfo("Robot are block!")
+              
 
         return self._episode_done
-    '''
-    def is_terminated(self , observations):
-        return True
-    
-    def is_truncated(self):
-        return True
-    '''
+
     def _compute_reward(self, observations, done):
 
-        #odom_data = self.get_odom()
-        base_coord = self.tf_position()
-        #pose_data = self.get_pose()
-        laser_msg = self.get_laser_scan()
-        collision_distance = min(laser_msg.ranges)
-
+        base_coord = self.amcl_position()
         reward = 0
 
-        self.reset_costmap()
-
-        #generate a new plan froom current position
-        #self.path = self.goal_setting(self.x ,self.y , self.z , 0.0  
-        #                              , base_coord[0] 
-        #                              , base_coord[1])
-
         #RMSE for calclate distance between current and goal position
-        distance_error = math.sqrt((self.x - base_coord[0])**2 
-                                   + (self.y - base_coord[1])**2 
-                                   + (self.z - base_coord[2])**2)
+        distance_error = np.linalg.norm(self.goal_pos - base_coord[:3])
+        #reward += -self.distance_weight*distance_error
         
-        
-        #reward += -self.distance_weight * distance_error
         #collision reward
-        if collision_distance < 0.07 :
+        if min(observations) < self.min_range :
             reward += self.collision_weight * self.collision_reward
+
         #proximity reward   
-        if collision_distance < 0.1: 
-            reward += -self.proximity_weight*abs( self.obstacle_proximity - min(self.obstacle_proximity , collision_distance))
+        if min(observations) < self.obstacle_proximity: 
+            #collision = -self.proximity_weight*abs( self.obstacle_proximity - min(self.obstacle_proximity , collision_distance))
+            #obstalce_reward = -self.proximity_weight*abs( self.obstacle_proximity - min(self.obstacle_proximity , min(observations)))
+            reward += -self.proximity_weight*abs( self.obstacle_proximity - min(self.obstacle_proximity , min(observations)))
+        
         #guide reward
-        
-        #if abs(self.x - (odom_data.pose.pose.position.x - self.set_initial_odom_x)) < 0.6 and abs(self.y - (odom_data.pose.pose.position.y - self.set_initial_odom_y)) < 0.6 :
-        #    self.truncated = True
-        #    reward += 100
-   
-        #define a numpy aray for simplify the definition of the guidance reward
-        #rob_pos = np.array([(odom_data.pose.pose.position.x - self.set_initial_odom_x) , (odom_data.pose.pose.position.y - self.set_initial_odom_y) ])
         if len(self.path) != 0 :
-            reward += self.guide_weight*self.guide_reward(self.path , base_coord[:2])
-
-
-        rospy.logdebug("reward=" + str(reward))
-        self.cumulated_reward += reward
-        rospy.logdebug("Cumulated_reward=" + str(self.cumulated_reward))
-        self.cumulated_steps += 1
-        rospy.logdebug("Cumulated_steps=" + str(self.cumulated_steps))
+            #rospy.loginfo("inside guide_weight : " + str(self.guide_weight*self.guide_reward(self.path , base_coord[:2])))
+            reward += self.guide_weight*self.guide_reward(self.path , base_coord[:2] , base_coord[3])
+           
+        #if self.truncated:
+        #    reward += 100
         
+        # Normalize the reward before returning
+        #reward = self.reward_normalizer.normalize(reward)
+        #         
         return reward
     
-    def guide_reward(self , path_coords, robot_pos):
+    """def plot_test_aheadpt(self , robot_pos , point_ahead , nearest_waypoint , guide_reward):
+
+        # Split into x and y
+        x = self.path[:, 0]
+        y = self.path[:, 1]
+        rospy.loginfo("robot_pos : " + str(robot_pos) + " point_ahead : " + str(point_ahead) + " nearest_waypoint : " + str(nearest_waypoint) + " guide_reward : " + str(guide_reward))
+        # Plot
+        plt.plot(x, y, marker='o')  # Line with dots at points
+        # Add a red dot for robot position 
+        plt.plot(robot_pos[0], robot_pos[1], 'ro')  # 'r' = red, 'o' = circle marker
+        #add green dot for ahead point 
+        plt.plot(point_ahead[0], point_ahead[1], 'go')
+        #add yellow dot for nearest waypoint
+        plt.plot(nearest_waypoint[0], nearest_waypoint[1], 'yo')
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.title('Plot of Points')
+        plt.grid(True)
+        plt.show()"""
+    
+    def guide_reward_debug(self , path_coords, robot_pos , yaw):
         """
-        Calculate the natural guidance reward.
+        Calculate the reward value that permit to calculate the distance of the robot respect a waypoint into the global path 
+        with a distance ahead respect the robot defined inside yaml file.
+
+        Args :
+            path_coords : 
         
-        Args:
-            path_coords (np.ndarray): Array of shape (n, 2) containing path x,y coordinates
-            robot_pos (np.ndarray): Robot's current position [x, y]
-            
-        Returns:
-            float: Reward value
         """
         if len(path_coords) == 0:
-            #rospy.logerr("Empty path!")
+            rospy.logerr("Empty path!")
             return 0.0
         # Find closest waypoint
         closest_idx, min_distance = self.find_closest_waypoint(path_coords, robot_pos)
-        
         # Calculate the goal position to reach 0.6m ahead
-        ahead_dist = 0.6
-        goal_postion = self.calculate_goal_position(path_coords , closest_idx , ahead_dist)
-        
+        goal_position = self.calculate_goal_position(path_coords , closest_idx , self.ahead_dist)
+        #goal_position = self.convert_global_to_robot_coord(goal_position[0] , goal_position[1] , robot_pos , yaw)
         # Calculate reward (negative distance to guidance point)
-        distance_to_guidance = -np.linalg.norm(goal_postion - robot_pos)
+        #distance_to_guidance = np.linalg.norm(goal_position - robot_pos)
         
+        return -np.linalg.norm(goal_position - robot_pos) , goal_position , path_coords[closest_idx]
+
+    def guide_reward(self , path_coords, robot_pos , yaw):
+        """
+        Calculate the reward value that permit to calculate the distance of the robot respect a waypoint into the global path 
+        with a distance ahead respect the robot defined inside yaml file.
+
+        Args :
+            path_coords : 
         
-        return distance_to_guidance
+        """
+        if len(path_coords) == 0:
+            rospy.logerr("Empty path!")
+            return 0.0
+        # Find closest waypoint
+        closest_idx, min_distance = self.find_closest_waypoint(path_coords, robot_pos)
+        # Calculate the goal position to reach 0.6m ahead
+        goal_position = self.calculate_goal_position(path_coords , closest_idx , self.ahead_dist)
+        #goal_position = self.convert_global_to_robot_coord(goal_position[0] , goal_position[1] , robot_pos , yaw)
+        # Calculate reward (negative distance to guidance point)
+        #distance_to_guidance = np.linalg.norm(goal_position - robot_pos)
+        
+        return -np.linalg.norm(goal_position - robot_pos)
+
 
     def find_closest_waypoint(self , path_coords, robot_pos):
         """
         Find the closest waypoint on the path to the robot's position.
         
-        Args:
-            path_coords (np.ndarray): Array of shape (n, 2) containing path x,y coordinates
-            robot_pos (np.ndarray): Robot's current position [x, y]
-            
-        Returns:
-            tuple: (closest point index, distance to closest point)
         """
+        path_coords = np.array(path_coords, dtype=np.float32)
+        robot_pos = np.array(robot_pos, dtype=np.float32)
         distances = np.linalg.norm(path_coords - robot_pos, axis=1)
         closest_idx = np.argmin(distances)
         return closest_idx, distances[closest_idx]
@@ -334,10 +445,20 @@ class TiagoNav(tiago_env.TiagoEnv):
         """
         Calculate cumulative distances along the path.
         
-            
-        Returns:
-            np.ndarray: Array with the goal position to reach 
         """
+
+        """accum_dist = 0.0
+        last_point = global_path[closest_idx]
+        guide_point = last_point  # default in case we don't accumulate enough
+
+        for i in range(closest_idx + 1, len(global_path)):
+            delta = np.linalg.norm(global_path[i] - last_point)
+            accum_dist += delta
+            last_point = global_path[i]
+            if accum_dist >= guide_distance:
+                guide_point = global_path[i]
+                break"""
+
         ahead_dist = 0.0
         curr_index = closest_idx
         curr_pos = path_coords[closest_idx]
@@ -357,10 +478,9 @@ class TiagoNav(tiago_env.TiagoEnv):
             if curr_index == path_coords.shape[0] - 1 :
                 break
         return goal_coord
-
     
-    def step(self , action):
-         # Execute the action
+    """    def step(self , action):
+        # Execute the action
         self._set_action(action)
     
         # Get the new observation
@@ -371,9 +491,9 @@ class TiagoNav(tiago_env.TiagoEnv):
     
         # Compute the reward
         reward = self._compute_reward(observation, done)
-    
+        
         # Return the results
-        return observation, reward, done, self.truncated, info
+        return observation, reward, done, self.truncated, info"""
 
 
     # Internal TaskEnv Methods
@@ -383,24 +503,22 @@ class TiagoNav(tiago_env.TiagoEnv):
         Discards all the laser readings that are not multiple in index of new_ranges
         value.
         """
-        new_data = data.ranges[21:-21]
+        new_data = data.ranges[self.n_discard_scan:-self.n_discard_scan]
         self._episode_done = False
         
         discretized_ranges = []
         #mod = len(data.ranges)/new_ranges
         
-        #rospy.logdebug("data=" + str(data))
         rospy.logdebug("new_ranges=" + str(new_ranges))
         rospy.logdebug("n_elements=" + str(len(new_data)/new_ranges))
-        
         for i, item in enumerate(new_data):
-            if (i%new_ranges==0):
-                if item == float ('inf') or np.isinf(item):
-                    discretized_ranges.append(self.max_laser_value)
-                elif np.isnan(item):
-                    discretized_ranges.append(self.min_laser_value)
-                else:
-                    discretized_ranges.append(float(item))
+            #if (i%new_ranges==0):
+            if item == float ('inf') or np.isinf(item) or (float((item)) > self.max_laser_value):
+                discretized_ranges.append(self.max_laser_value)
+            elif np.isnan(item) or (float(item) < self.min_laser_value):
+                discretized_ranges.append(self.min_laser_value)
+            else:
+                discretized_ranges.append(float(item))
                 """    
                 if (self.min_range > item > 0):
                     rospy.logerr("done Validation >>> item=" + str(item)+"< "+str(self.min_range))
@@ -409,19 +527,9 @@ class TiagoNav(tiago_env.TiagoEnv):
                     rospy.logdebug("NOT done Validation >>> item=" + str(item)+"< "+str(self.min_range))
                 """    
         rospy.logdebug("New observation dimension : " + str(len(discretized_ranges)))
+        
+        #for make the laser scan value divisible by 90
+        discretized_ranges[:2] = [25.0, 25.0]
+        discretized_ranges[-2:] = [25.0, 25.0]
 
         return discretized_ranges
-        
-        
-    def get_vector_magnitude(self, vector):
-        """
-        It calculated the magnitude of the Vector3 given.
-        This is usefull for reading imu accelerations and knowing if there has been 
-        a crash
-        :return:
-        """
-        contact_force_np = np.array((vector.x, vector.y, vector.z))
-        force_magnitude = np.linalg.norm(contact_force_np)
-
-        return force_magnitude
-
