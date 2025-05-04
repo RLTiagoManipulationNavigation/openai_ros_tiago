@@ -19,7 +19,12 @@ import actionlib
 from move_base_msgs.msg import MoveBaseActionGoal
 from nav_msgs.srv import GetPlan , GetMap
 from geometry_msgs.msg import PoseArray , PoseStamped
+from gazebo_msgs.srv import DeleteModel, SpawnModel, SetModelState , GetModelState , GetModelStateRequest
 import tf2_ros
+
+from tf.transformations import quaternion_from_euler , euler_from_quaternion
+import xacro
+from gazebo_msgs.msg import ModelState
 
 
 #roslaunch tiago_2dnav_gazebo tiago_navigation.launch public_sim:=true
@@ -66,11 +71,6 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         self.hand_joints = ['gripper_left_finger_joint' , 'gripper_right_finger_joint']
         # Doesnt have any accesibles
         self.controllers_list = []
-        #self.controllers_list = [
-        #    "arm_controller",
-        #    "mobile_base_controller",
-        #    "joint_state_controller"
-        #]
 
         # It doesnt use namespace
         self.robot_name_space = ""
@@ -78,8 +78,8 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         # We launch the init function of the Parent Class robot_gazebo_env.RobotGazeboEnv
         super(TiagoEnv, self).__init__(controllers_list=self.controllers_list,
                                             robot_name_space=self.robot_name_space,
-                                            reset_controls=True,
-                                            #start_init_physics_parameters=False,
+                                            reset_controls=False,
+                                            start_init_physics_parameters=False,
                                             reset_world_or_sim="WORLD")
 
 
@@ -95,6 +95,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         rospy.Subscriber("/xtion/depth_registered/image_raw", Image, self._camera_depth_image_raw_callback)
         rospy.Subscriber("/xtion/depth_registered/points", PointCloud2, self._camera_depth_points_callback)
         rospy.Subscriber("/xtion/rgb/image_rect_color", Image, self._camera_rgb_image_raw_callback)
+        #Laser scan topic 
         rospy.Subscriber("/scan_raw", LaserScan, self._laser_scan_callback)
         #Global Planner
         rospy.Subscriber('/move_base/GlobalPlanner/plan', Path, self._plan_callback)
@@ -105,6 +106,11 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         #rospy.Subscriber('/hand_controller/follow_joint_trajectory/feedback', FollowJointTrajectoryActionFeedback, self._hand_feedback_callback)
         #rospy.Subscriber('/head_controller/follow_joint_trajectory/feedback', FollowJointTrajectoryActionFeedback, self._head_feedback_callback)
         #rospy.Subscriber('/torso_controller/follow_joint_trajectory/feedback', FollowJointTrajectoryActionFeedback, self._torso_feedback_callback)
+
+        rospy.Subscriber('/amcl_pose' , PoseWithCovarianceStamped , self._amcl_pose_callback)
+
+        #local costmap topic
+        rospy.Subscriber('/move_base/local_costmap/costmap' , OccupancyGrid , self._local_costmap_callback)
 
 
         self._cmd_vel_pub = rospy.Publisher('/mobile_base_controller/cmd_vel', Twist, queue_size=1)
@@ -119,6 +125,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         # Create publisher for /initialpose topic
         self.init_pose_pub = rospy.Publisher('/initialpose', PoseWithCovarianceStamped, queue_size=1)
 
+        # Publisher for generate a Global plan 
         self.make_plan = rospy.ServiceProxy("/move_base/make_plan", GetPlan)
 
         #reset simulation 
@@ -136,6 +143,12 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         # Initialize TF listener
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        #gazebo control
+        self.spawn_model = rospy.ServiceProxy('/gazebo/spawn_urdf_model', SpawnModel)
+        self.delete_model = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)
+        self.set_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+        self.curr_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
 
         self._check_all_systems_ready()
         self._check_publishers_connection()
@@ -172,6 +185,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         #self._check_plan_ready()
         self._check_joint_state_ready()
         self._check_arm_state_ready()
+        self._check_amcl_pose_ready()
         rospy.logdebug("ALL SENSORS READY")
 
     def _check_arm_state_ready(self):
@@ -282,7 +296,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         return self.laser_scan
     
     def _check_plan_ready(self):
-        self.gazebo.unpauseSim()
+        #self.gazebo.unpauseSim()
         self.plan = None
         rospy.logdebug("Waiting for /move_base/GlobalPlanner/plan to be READY...")
         while self.plan is None and not rospy.is_shutdown():
@@ -292,8 +306,20 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
 
             except:
                 rospy.logerr("Current /move_base/GlobalPlanner/plan not ready yet")
-        self.gazebo.pauseSim()
+        #self.gazebo.pauseSim()
         return self.plan
+    
+    def _check_amcl_pose_ready(self):
+        self.amcl_pose = None
+        rospy.logdebug("Waiting for /amcl_pose to be READY...")
+        while self.amcl_pose is None and not rospy.is_shutdown():
+            try:
+                self.amcl_pose = rospy.wait_for_message("/amcl_pose" , PoseWithCovarianceStamped , timeout=1.0)
+                rospy.logdebug("Current /amcl_pose =>")
+
+            except:
+                rospy.logerr("Current /amcl_pose not ready yet")
+        return self.amcl_pose
         
 
     def _odom_callback(self, data):
@@ -320,6 +346,11 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
     def _arm_state_callback(self , data):
         self.arm_state = data
 
+    def _amcl_pose_callback(self, data):    
+        self.amcl_pose = data
+
+    def _local_costmap_callback(self , data):
+        self.local_costmap = data    
     """
     def _head_feedback_callback(self , data):
         self.head = data 
@@ -350,7 +381,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
     def _check_publishers_connection(self):
         """
         Checks that all the publishers are working
-        :return:
+        
         """
         rate = rospy.Rate(10)  # 10hz
         while self._cmd_vel_pub.get_num_connections() == 0 and not rospy.is_shutdown():
@@ -419,8 +450,11 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
     # ----------------------------
     
     def reset_position(self):
-        self.gazebo.unpauseSim()
-
+        '''
+         Reset all the environment for restart the new simulation without uncorrect param
+        '''
+        #self.gazebo.unpauseSim()
+        
         # Create the initial pose message
         init_pose_msg = PoseWithCovarianceStamped()
     
@@ -435,44 +469,23 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         )
             
         self.init_pose_pub.publish(init_pose_msg)
-        rospy.logwarn("Set the robot's iniital pose")
+        rospy.logdebug("Set the robot's iniital pose")
         #reset global and local costmap
         self.clear_costmaps()    
-        rospy.logwarn("Reset obstacles complete !")
+        rospy.logdebug("Reset obstacles complete !")
   
         # Make sure the publisher has time to connect
-        rospy.sleep(5.0)
+        #rospy.sleep(0.2)
         self.map_pub.publish(self.initial_map)    
-        rospy.logwarn("Reset map complete!")
-        rospy.sleep(2.0)
+        rospy.logdebug("Reset map complete!")
+        #rospy.sleep(0.2)
 
-        # Get transform from map to base_footprint
-        transform = self.tf_buffer.lookup_transform(
-                'map',
-                'base_footprint',
-                rospy.Time(0),
-                rospy.Duration(1.0)
-        )
-            
-        # Print current position
-        rospy.loginfo(f"Current position: x={transform.transform.translation.x}, "
-                         f"y={transform.transform.translation.y}, "
-                         f"z={transform.transform.translation.z}")
-        
-    
-        # Publish the message
-        #self.init_pose_pub.publish(init_pose_msg)
-        #rospy.loginfo("Published reset position to /initialpose")
-    
-        # Give time for the message to be processed
-        #rospy.sleep(0.5)
-
-        self.gazebo.pauseSim()
+        #self.gazebo.pauseSim()
 
     def reset_costmap(self):   
-        self.gazebo.unpauseSim()
+        #self.gazebo.unpauseSim()
         self.clear_costmaps()  
-        self.gazebo.pauseSim() 
+        #self.gazebo.pauseSim() 
     
 
 
@@ -499,7 +512,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
             float64[] effort
             duration time_from_start    
         """
-        self.gazebo.unpauseSim()
+        #self.gazebo.unpauseSim()
 
         if len(target_positions) != len(self.arm_joints):
             rospy.logerr("Number of positions must match number of joints")
@@ -535,12 +548,12 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
             if self.movement_completed():
                 rospy.logdebug("error : " + str(self.movement_completed()))
                 rospy.loginfo("Movement completed successfully")
-                self.gazebo.pauseSim()
+                #self.gazebo.pauseSim()
                 return True
             rate.sleep()
         
         rospy.logerr("Movement timed out")
-        self.gazebo.pauseSim()
+        #self.gazebo.pauseSim()
         return False
 
     def movement_completed(self, tolerance=0.01):
@@ -555,18 +568,16 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         return np.all(np.abs(np.array(self.arm_state.error.positions)) < tolerance)
 
 
-    def move_base(self, linear_speed, angular_speed, epsilon=0.05, update_rate=10, min_laser_distance=-1):
+    def move_base(self, linear_speed, angular_speed):
         """
         It will move the base based on the linear and angular speeds given.
         It will wait untill those twists are achived reading from the odometry topic.
         :param linear_speed: Speed in the X axis of the robot base frame
         :param angular_speed: Speed of the angular turning of the robot base frame
-        :param epsilon: Acceptable difference between the speed asked and the odometry readings
-        :param update_rate: Rate at which we check the odometry.
         :return: 
         """
-        self.gazebo.unpauseSim()
-
+        #self.gazebo.unpauseSim()
+        
         cmd_vel_value = Twist()
         cmd_vel_value.linear.x = linear_speed
         cmd_vel_value.angular.z = angular_speed
@@ -574,103 +585,28 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         self._check_publishers_connection()
         self._cmd_vel_pub.publish(cmd_vel_value)
         time.sleep(0.2)
+        """
+        
         #time.sleep(0.02)
         '''
         self.wait_until_twist_achieved(cmd_vel_value,
                                         epsilon,
                                         update_rate,
                                         min_laser_distance)
-        '''
+        """
 
-        self.gazebo.pauseSim()
-                        
-    
-    def wait_until_twist_achieved(self, cmd_vel_value, epsilon, update_rate, min_laser_distance=-1):
-        """
-        We wait for the cmd_vel twist given to be reached by the robot reading
-        from the odometry.
-        :param cmd_vel_value: Twist we want to wait to reach.
-        :param epsilon: Error acceptable in odometry readings.
-        :param update_rate: Rate at which we check the odometry.
-        :return:
-        """
-        rospy.logwarn("START wait_until_twist_achieved...")
-        
-        rate = rospy.Rate(update_rate)
-        start_wait_time = rospy.get_rostime().to_sec()
-        end_wait_time = 0.0
-        epsilon = 0.05
-        
-        rospy.logdebug("Desired Twist Cmd>>" + str(cmd_vel_value))
-        rospy.logdebug("epsilon>>" + str(epsilon))
-        
-        linear_speed = cmd_vel_value.linear.x
-        angular_speed = cmd_vel_value.angular.z
-        
-        linear_speed_plus = linear_speed + epsilon
-        linear_speed_minus = linear_speed - epsilon
-        angular_speed_plus = angular_speed + epsilon
-        angular_speed_minus = angular_speed - epsilon
-        
-        while not rospy.is_shutdown():
-            
-            crashed_into_something = self.has_crashed(min_laser_distance)
-            
-            current_odometry = self._check_odom_ready()
-            odom_linear_vel = current_odometry.twist.twist.linear.x
-            odom_angular_vel = current_odometry.twist.twist.angular.z
-            
-            rospy.logdebug("Linear VEL=" + str(odom_linear_vel) + ", ?RANGE=[" + str(linear_speed_minus) + ","+str(linear_speed_plus)+"]")
-            rospy.logdebug("Angular VEL=" + str(odom_angular_vel) + ", ?RANGE=[" + str(angular_speed_minus) + ","+str(angular_speed_plus)+"]")
-            
-            linear_vel_are_close = (odom_linear_vel <= linear_speed_plus) and (odom_linear_vel > linear_speed_minus)
-            angular_vel_are_close = (odom_angular_vel <= angular_speed_plus) and (odom_angular_vel > angular_speed_minus)
-            
-            if linear_vel_are_close and angular_vel_are_close:
-                rospy.logwarn("Reached Velocity!")
-                end_wait_time = rospy.get_rostime().to_sec()
-                break
-            
-            if crashed_into_something:
-                rospy.logerr("Tiago has crashed, stopping movement!")
-                break
-            
-            rospy.logwarn("Not there yet, keep waiting...")
-            rate.sleep()
-        delta_time = end_wait_time- start_wait_time
-        rospy.logdebug("[Wait Time=" + str(delta_time)+"]")
-        
-        rospy.logwarn("END wait_until_twist_achieved...")
-        
-        return delta_time
-        
-    def has_crashed(self, min_laser_distance):
-        """
-        It states based on the laser scan if the robot has crashed or not.
-        Crashed means that the minimum laser reading is lower than the
-        min_laser_distance value given.
-        If min_laser_distance == -1, it returns always false, because its the way
-        to deactivate this check.
-        """
-        robot_has_crashed = False
-        
-        if min_laser_distance != -1:
-            laser_data = self.get_laser_scan()
-            for i, item in enumerate(laser_data.ranges):
-                if item == float ('Inf') or np.isinf(item):
-                    pass
-                elif np.isnan(item):
-                   pass
-                else:
-                    # Has a Non Infinite or Nan Value
-                    if (item < min_laser_distance):
-                        rospy.logerr("Tiago HAS CRASHED >>> item=" + str(item)+"< "+str(min_laser_distance))
-                        robot_has_crashed = True
-                        break
-        return robot_has_crashed
+        #self.gazebo.pauseSim()
     
     def goal_setting(self , x , y , z , yaw , curr_x_pos , curr_y_pos):
-        self.gazebo.unpauseSim()
+        #self.gazebo.unpauseSim()
+
+        '''
+         Generate a global path given the initial position of the robot and the goal position 
+
+         Return:
+            positions : A numpy array of dimension (N , 2) that contain the coordinates of global path.
+            If impossible to generate a path method return Null
+        '''
     
         """
         # Create the goal message
@@ -734,7 +670,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
             #rospy.loginfo(str(response))
         except rospy.ServiceException as e:
             rospy.logerr("Failed to make plan: %s" % e)
-        self.gazebo.pauseSim()
+        #self.gazebo.pauseSim()
         # Find all position blocks in the message
         position_blocks = re.findall(r'position:\s*x:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*y:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', str(response))
         
@@ -742,7 +678,7 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         if position_blocks:
             positions = np.array(position_blocks, dtype=float)
             return positions
-        return np.array([])
+        return None
     
     def tf_position(self):
         # Get transform from map to base_footprint
@@ -760,11 +696,65 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
             #rospy.loginfo(f"Current position: x={transform.transform.translation.x}, "
             #             f"y={transform.transform.translation.y}, "
             #             f"z={transform.transform.translation.z}")
+
+            """
+            transform_laser = self.tf_buffer.lookup_transform(
+                    'base_laser_link',
+                    'base_footprint',
+                    rospy.Time(0),
+                    rospy.Duration(1.0)
+            )
+            # Print current position
+            rospy.loginfo(f"Current position: x={transform_laser.transform.translation.x}, "
+                         f"y={transform_laser.transform.translation.y}, "
+                         f"z={transform_laser.transform.translation.z}")
+            """
+
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
             rospy.logerr(f"TF lookup failed: {e}")
             base_coord = []
         return base_coord
+    
+    def amcl_position(self):
+        
+        '''
+        Metod for return the current coordinates of the robot inside the environment
+
+        Return :
+            base_coord : Numpy array that contain the coordinates of the robot inside environment and the yaw 
+        '''
+        robot_pos = self.get_amcl_pos()
+
+        # Extract orientation (quaternion)
+        orientation = robot_pos.pose.pose.orientation
+        quaternion = (orientation.x, orientation.y, orientation.z, orientation.w)
+        yaw = self.quaternion_to_yaw(quaternion)
+
+        base_coord = np.array([
+            robot_pos.pose.pose.position.x,
+            robot_pos.pose.pose.position.y,
+            robot_pos.pose.pose.position.z,
+            yaw
+        ])
+        
+        return base_coord
+    
+    def quaternion_to_yaw(self, quaternion):
+
+        euler = euler_from_quaternion(quaternion)
+        yaw = euler[2]  # Yaw angle is the third element
+        return yaw
+    
+    def gen_local_costamp(self):
+
+        local_costmap = self.get_local_costmap()
+        local_costmap = local_costmap.data
+
+        if len(local_costmap) == 0:
+            rospy.logerr("Empty local costmap error!")
+
+        return local_costmap
         
 
     def get_odom(self):
@@ -787,7 +777,13 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
     
     def get_plan(self):
         return self.plan
-        
+    
+    def get_amcl_pos(self):
+        return self.amcl_pose
+    
+    def get_local_costmap(self):
+        return self.local_costmap
+    
     def reinit_sensors(self):
         """
         This method is for the tasks so that when reseting the episode
@@ -795,3 +791,178 @@ class TiagoEnv(robot_gazebo_env.RobotGazeboEnv):
         
         """
         
+    def load_robot_description(self, xacro_path):
+        """Load robot description from XACRO file"""
+        try:
+            # Process the XACRO file
+            robot_description = xacro.process_file(xacro_path)
+            # Convert to XML string
+            xml_string = robot_description.toxml()
+            return xml_string
+        except Exception as e:
+            rospy.logerr(f"Failed to load robot description: {e}")
+            return None
+
+    def create_custom_pose(self, x, y, z, roll, pitch, yaw):
+        """Create a custom pose for the robot"""
+        # Convert euler angles to quaternion
+        orientation = quaternion_from_euler(roll, pitch, yaw)
+        
+        pose = Pose()
+        pose.position = Point(x, y, z)
+        pose.orientation = Quaternion(*orientation)
+        
+        return pose
+
+    def spawn_robot(self, model_name, xacro_path, x=0, y=0, z=0, 
+                   roll=0, pitch=0, yaw=0, namespace=""):
+        """Spawn robot with custom position and orientation"""
+        try:
+            # First, try to delete the model if it exists
+            try:
+                self.delete_model(model_name)
+                rospy.sleep(0.5)  # Wait for deletion to complete
+            except rospy.ServiceException:
+                pass  # Model doesn't exist, which is fine
+
+            # Load robot description
+            robot_xml = self.load_robot_description(xacro_path)
+            if robot_xml is None:
+                return False
+
+            # Create custom pose
+            initial_pose = self.create_custom_pose(x, y, z, roll, pitch, yaw)
+
+            # Spawn the robot
+            response = self.spawn_model(
+                model_name=model_name,
+                model_xml=robot_xml,
+                robot_namespace=namespace,
+                initial_pose=initial_pose,
+                reference_frame="world"
+            )
+
+            if response.success:
+                rospy.loginfo(f"Successfully spawned robot '{model_name}' at position: "
+                            f"x={x:.2f}, y={y:.2f}, z={z:.2f}")
+                return True
+            else:
+                rospy.logerr(f"Failed to spawn robot: {response.status_message}")
+                return False
+
+        except rospy.ServiceException as e:
+            rospy.logerr(f"Service call failed: {e}")
+            return False
+
+    def update_robot_pose(self, model_name, x, y, z, roll, pitch, yaw):
+        """Update robot pose after spawning"""
+        try:
+            state_msg = ModelState()
+            state_msg.model_name = model_name
+            state_msg.pose = self.create_custom_pose(x, y, z, roll, pitch, yaw)
+            state_msg.reference_frame = "world"
+
+            response = self.set_state(state_msg)
+            
+            if response.success:
+                rospy.loginfo(f"Successfully updated robot pose")
+                return True
+            else:
+                rospy.logerr(f"Failed to update robot pose")
+                return False
+
+        except rospy.ServiceException as e:
+            rospy.logerr(f"Service call failed: {e}")
+            return False
+        
+    def gazebo_robot_state(self):
+        """
+        Calls /gazebo/get_model_state and returns a GetModelStateResponse,
+        which contains `.pose` and `.twist` of the specified model.
+        """
+
+        rospy.wait_for_service('/gazebo/get_model_state')  
+
+        try:
+            # Create a proxy and request object
+            req = GetModelStateRequest()
+            req.model_name = 'tiago'
+            req.relative_entity_name = 'world'
+
+            # Call the service
+            resp = self.curr_state(req)  
+
+            if not resp.success:
+                rospy.logwarn("Failed to get model state for '%s'" % self.model_name)
+                return None
+            
+            # Extract orientation (quaternion)
+            orientation = resp.pose.orientation
+            quaternion = (orientation.x, orientation.y, orientation.z, orientation.w)
+            yaw = self.quaternion_to_yaw(quaternion)
+
+            base_coord = np.array([
+                resp.pose.position.x,
+                resp.pose.position.y,
+                resp.pose.position.z,
+                yaw
+            ])
+
+            # Return the full response (pose + twist + success flag)
+            return base_coord
+
+        except rospy.ServiceException as e:
+            rospy.logerr("Service call /gazebo/get_model_state failed: %s" % e)
+            return None
+        
+    def gazebo_reset(self, x, y, yaw):
+        """
+        Teleports Tiago to (x, y, yaw) in the 'world' frame.
+        """
+        # 1. Build the service request
+        self.set_state
+        state_msg = ModelState()
+        state_msg.model_name = 'tiago'
+        state_msg.pose = Pose(
+            position=Point(x=x, y=y, z=0.0),
+            orientation=Quaternion(0.0, 0.0, 
+                                   np.sin(yaw/2.0), 
+                                   np.cos(yaw/2.0))
+        )
+        state_msg.twist = Twist()  # zero velocities
+        state_msg.reference_frame = 'world'
+
+        # Wait for and call the service
+        rospy.wait_for_service('/gazebo/set_model_state')
+        try:
+            resp = self.set_state(state_msg)
+            if not resp.success:
+                rospy.logwarn("Failed to set model state: %s", resp.status_message)
+        except rospy.ServiceException as e:
+            rospy.logerr("Service call /gazebo/set_model_state failed: %s", e)
+
+        # Create the initial pose message
+        init_pose_msg = PoseWithCovarianceStamped()
+    
+        # Set the header
+        init_pose_msg.header.frame_id = "map"
+        init_pose_msg.header.stamp = rospy.Time.now()
+    
+        # Set the position
+        init_pose_msg.pose.pose = Pose(
+            Point(0.0, 0.0, 0.0),  # x, y, z position
+            Quaternion(0.0, 0.0, 0.0, 1.0)  # x, y, z, w orientation
+        )
+            
+        self.init_pose_pub.publish(init_pose_msg)
+        rospy.logdebug("Set the robot's iniital pose")
+
+        #reset global and local costmap
+        self.clear_costmaps()    
+        rospy.logdebug("Reset obstacles complete !")
+  
+        # Make sure the publisher has time to connect
+        #rospy.sleep(0.2)
+        self.map_pub.publish(self.initial_map)    
+        rospy.logdebug("Reset map complete!")
+
